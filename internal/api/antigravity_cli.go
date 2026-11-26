@@ -260,10 +260,8 @@ func (r *AntigravityCLIRunner) awaitReady(ctx context.Context, sess *agySession)
 		}
 		ports, err := r.client.discoverPorts(ctx, pid)
 		if err == nil && len(ports) > 0 {
-			if conn, _ := r.client.probeForConnectAPI(ctx, ports, sess.csrfToken); conn != nil {
-				if _, status, perr := r.post(ctx, conn, agyQuotaSummaryRPC); perr == nil && status == http.StatusOK {
-					return conn, nil
-				}
+			if conn := r.findQuotaConn(ctx, ports, sess.csrfToken); conn != nil {
+				return conn, nil
 			}
 		}
 		select {
@@ -273,6 +271,33 @@ func (r *AntigravityCLIRunner) awaitReady(ctx context.Context, sess *agySession)
 		}
 	}
 	return nil, ErrAgyNotReady
+}
+
+// findQuotaConn returns the first port and scheme that answers the quota RPC
+// with a parseable summary. agy 1.5.x listens on a TLS/gRPC port and a plain
+// HTTP port and no longer serves GetUnleashData, so the generic Connect probe
+// cannot be used here (issue #168).
+func (r *AntigravityCLIRunner) findQuotaConn(ctx context.Context, ports []int, csrfToken string) *AntigravityConnection {
+	for _, port := range ports {
+		for _, scheme := range []string{"https", "http"} {
+			conn := &AntigravityConnection{
+				BaseURL:   fmt.Sprintf("%s://127.0.0.1:%d", scheme, port),
+				CSRFToken: csrfToken,
+				Port:      port,
+				Protocol:  scheme,
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			body, status, err := r.post(probeCtx, conn, agyQuotaSummaryRPC)
+			cancel()
+			if err != nil || status != http.StatusOK {
+				continue
+			}
+			if _, perr := ParseAgyQuotaSummary(body); perr == nil {
+				return conn
+			}
+		}
+	}
+	return nil
 }
 
 // sessionHealthy returns true if the current session still serves quota data.

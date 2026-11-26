@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -182,6 +184,62 @@ func TestAgyRunner_SendsCSRFToken(t *testing.T) {
 	_, status, err := r.post(context.Background(), &AntigravityConnection{BaseURL: srv.URL, CSRFToken: token}, agyQuotaSummaryRPC)
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("post with token: status=%d err=%v", status, err)
+	}
+}
+
+// agy 1.5.x no longer serves GetUnleashData (bare 404), so readiness must be
+// decided by the quota RPC itself, on HTTPS or plain HTTP (issue #168).
+func TestAgyRunner_FindQuotaConn_WithoutUnleashData(t *testing.T) {
+	const token = "test-csrf-token"
+	fixture, err := os.ReadFile(filepath.Join("testdata", "agy_quota_summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != agyQuotaSummaryRPC || r.Header.Get("X-Codeium-Csrf-Token") != token {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(fixture)
+	})
+
+	for name, srv := range map[string]*httptest.Server{
+		"http":  httptest.NewServer(handler),
+		"https": httptest.NewTLSServer(handler),
+	} {
+		t.Run(name, func(t *testing.T) {
+			defer srv.Close()
+			port := srv.Listener.Addr().(*net.TCPAddr).Port
+
+			r := NewAntigravityCLIRunner(nil)
+			defer r.Stop()
+			conn := r.findQuotaConn(context.Background(), []int{port}, token)
+			if conn == nil {
+				t.Fatal("expected a connection on a port that serves the quota RPC")
+			}
+			if want := name + "://127.0.0.1:" + strconv.Itoa(port); conn.BaseURL != want || conn.CSRFToken != token {
+				t.Fatalf("conn = %+v, want BaseURL %s with token", conn, want)
+			}
+		})
+	}
+}
+
+func TestAgyRunner_FindQuotaConn_RejectsNonQuotaPort(t *testing.T) {
+	for name, handler := range map[string]http.Handler{
+		"404":          http.NotFoundHandler(),
+		"200-no-quota": http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{}`)) }),
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(handler)
+			defer srv.Close()
+			port := srv.Listener.Addr().(*net.TCPAddr).Port
+
+			r := NewAntigravityCLIRunner(nil)
+			defer r.Stop()
+			if conn := r.findQuotaConn(context.Background(), []int{port}, "t"); conn != nil {
+				t.Fatalf("expected no connection, got %+v", conn)
+			}
+		})
 	}
 }
 
