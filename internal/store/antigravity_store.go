@@ -366,6 +366,19 @@ func (s *Store) UpdateAntigravityCycle(modelID string, peakUsage, totalDelta flo
 	return nil
 }
 
+// SetAntigravityCycleResetTime sets the reset time of the active cycle.
+func (s *Store) SetAntigravityCycleResetTime(modelID string, resetTime time.Time) error {
+	_, err := s.db.Exec(
+		`UPDATE antigravity_reset_cycles SET reset_time = ?
+		WHERE model_id = ? AND cycle_end IS NULL`,
+		resetTime.Format(time.RFC3339Nano), modelID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to set antigravity cycle reset time: %w", err)
+	}
+	return nil
+}
+
 // QueryActiveAntigravityCycle returns the active cycle for an Antigravity model.
 func (s *Store) QueryActiveAntigravityCycle(modelID string) (*AntigravityResetCycle, error) {
 	var cycle AntigravityResetCycle

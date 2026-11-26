@@ -123,6 +123,16 @@ func (t *AntigravityTracker) processModel(model api.AntigravityModelQuota, captu
 		}
 	}
 
+	// Method 1b: The cycle's window has ended and agy now reports a later
+	// window or none at all (agy omits resetTime on an untouched bucket). This
+	// needs no in-memory history, so it also closes windows that expired
+	// during a restart or polling gap.
+	if !resetDetected && cycle.ResetTime != nil && capturedAt.After(*cycle.ResetTime) &&
+		(model.ResetTime == nil || model.ResetTime.Sub(*cycle.ResetTime) > 10*time.Minute) {
+		resetDetected = true
+		resetReason = "reset time passed"
+	}
+
 	// Method 2: Remaining fraction increased significantly (quota reset)
 	if !resetDetected && t.hasLastValues {
 		if lastFraction, ok := t.lastFractions[modelID]; ok {
@@ -166,6 +176,10 @@ func (t *AntigravityTracker) processModel(model api.AntigravityModelQuota, captu
 		t.lastFractions[modelID] = model.RemainingFraction
 		if model.ResetTime != nil {
 			t.lastResetTimes[modelID] = *model.ResetTime
+		} else {
+			// The new cycle has no window yet; the old one's reset time must
+			// not make the first dated poll look like another reset.
+			delete(t.lastResetTimes, modelID)
 		}
 		t.logger.Info("Detected Antigravity model reset",
 			"model", modelID,
@@ -173,10 +187,20 @@ func (t *AntigravityTracker) processModel(model api.AntigravityModelQuota, captu
 			"oldResetTime", cycle.ResetTime,
 			"newResetTime", model.ResetTime,
 		)
-		if t.onReset != nil {
+		// An idle bucket's window rolls forward on its own, so only a window
+		// that saw usage is worth a reset notification.
+		if t.onReset != nil && (cycle.PeakUsage > 0 || cycle.TotalDelta > 0) {
 			t.onReset(modelID)
 		}
 		return nil
+	}
+
+	// Same cycle - a cycle opened without a window adopts the one agy reports
+	// once usage starts it, so the window can expire later.
+	if cycle.ResetTime == nil && model.ResetTime != nil {
+		if err := t.store.SetAntigravityCycleResetTime(modelID, *model.ResetTime); err != nil {
+			return fmt.Errorf("failed to set cycle reset time: %w", err)
+		}
 	}
 
 	// Same cycle - update stats

@@ -466,3 +466,207 @@ func TestAntigravityTracker_UsageSummary_CalculatesRateAndClampsProjection(t *te
 		t.Fatalf("ProjectedUsage = %v, want 1.0 (clamped)", summary.ProjectedUsage)
 	}
 }
+
+// After a restart or polling gap the tracker has no in-memory history, so a
+// window whose reset time has passed must still be closed. agy 1.5.x also
+// omits resetTime on an untouched bucket (issue #168 follow-up).
+func TestAntigravityTracker_ExpiredWindowAfterRestart_ClosesCycle(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 11, 21, 19, 0, 0, 0, time.UTC)
+	oldReset := base.Add(5 * time.Hour)
+	captured := base.Add(5 * 24 * time.Hour)
+	newReset := captured.Add(5 * time.Hour)
+
+	for name, modelReset := range map[string]*time.Time{
+		"later reset": &newReset,
+		"no reset":    nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _ := store.New(":memory:")
+			defer s.Close()
+			if _, err := s.CreateAntigravityCycle("3p-5h", base, &oldReset); err != nil {
+				t.Fatalf("CreateAntigravityCycle: %v", err)
+			}
+
+			tr := NewAntigravityTracker(s, nil) // fresh: no lastFractions/lastResetTimes
+			if err := tr.processModel(makeModel("3p-5h", "Claude + GPT 5h", 1.0, modelReset), captured); err != nil {
+				t.Fatalf("processModel: %v", err)
+			}
+
+			history, _ := s.QueryAntigravityCycleHistory("3p-5h")
+			if len(history) != 1 {
+				t.Fatalf("closed cycles = %d, want 1", len(history))
+			}
+			if history[0].CycleEnd == nil || !history[0].CycleEnd.Equal(oldReset) {
+				t.Fatalf("CycleEnd = %v, want %v", history[0].CycleEnd, oldReset)
+			}
+			active, _ := s.QueryActiveAntigravityCycle("3p-5h")
+			if active == nil || !active.CycleStart.Equal(captured) {
+				t.Fatalf("active cycle = %+v, want one starting at %v", active, captured)
+			}
+			if (modelReset == nil) != (active.ResetTime == nil) {
+				t.Fatalf("active ResetTime = %v, want %v", active.ResetTime, modelReset)
+			}
+		})
+	}
+}
+
+func TestAntigravityTracker_NoResetTimeWithinWindow_KeepsCycle(t *testing.T) {
+	t.Parallel()
+	s, _ := store.New(":memory:")
+	defer s.Close()
+	base := time.Date(2026, 11, 26, 9, 0, 0, 0, time.UTC)
+	reset := base.Add(5 * time.Hour)
+	if _, err := s.CreateAntigravityCycle("3p-5h", base, &reset); err != nil {
+		t.Fatalf("CreateAntigravityCycle: %v", err)
+	}
+
+	tr := NewAntigravityTracker(s, nil)
+	if err := tr.processModel(makeModel("3p-5h", "Claude + GPT 5h", 1.0, nil), base.Add(time.Hour)); err != nil {
+		t.Fatalf("processModel: %v", err)
+	}
+	if history, _ := s.QueryAntigravityCycleHistory("3p-5h"); len(history) != 0 {
+		t.Fatalf("closed cycles = %d, want 0", len(history))
+	}
+}
+
+// A cycle opened while agy reported no window adopts the reset time once agy
+// starts one, so the window can expire later even across restarts.
+func TestAntigravityTracker_CycleWithoutReset_AdoptsResetTime(t *testing.T) {
+	t.Parallel()
+	s, _ := store.New(":memory:")
+	defer s.Close()
+	base := time.Date(2026, 11, 26, 9, 0, 0, 0, time.UTC)
+
+	tr := NewAntigravityTracker(s, nil)
+	if err := tr.Process(makeAntigravitySnapshot(base, []api.AntigravityModelQuota{
+		makeModel("3p-5h", "Claude + GPT 5h", 1.0, nil),
+	})); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	reset := base.Add(time.Hour + 5*time.Hour)
+	if err := tr.Process(makeAntigravitySnapshot(base.Add(time.Hour), []api.AntigravityModelQuota{
+		makeModel("3p-5h", "Claude + GPT 5h", 0.9, &reset),
+	})); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	if history, _ := s.QueryAntigravityCycleHistory("3p-5h"); len(history) != 0 {
+		t.Fatalf("closed cycles = %d, want 0", len(history))
+	}
+	active, _ := s.QueryActiveAntigravityCycle("3p-5h")
+	if active == nil || active.ResetTime == nil || !active.ResetTime.Equal(reset) {
+		t.Fatalf("active cycle = %+v, want ResetTime %v", active, reset)
+	}
+	if active.TotalDelta < 0.099 || active.TotalDelta > 0.101 {
+		t.Fatalf("TotalDelta = %v, want ~0.1", active.TotalDelta)
+	}
+}
+
+func TestAntigravityTracker_ExpiredWindow_NotifiesOnlyAfterUsage(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 11, 26, 9, 0, 0, 0, time.UTC)
+	oldReset := base.Add(5 * time.Hour)
+
+	for name, tc := range map[string]struct {
+		peak float64
+		want bool
+	}{
+		"idle window": {0, false},
+		"used window": {0.3, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _ := store.New(":memory:")
+			defer s.Close()
+			if _, err := s.CreateAntigravityCycle("gemini-5h", base, &oldReset); err != nil {
+				t.Fatalf("CreateAntigravityCycle: %v", err)
+			}
+			if err := s.UpdateAntigravityCycle("gemini-5h", tc.peak, tc.peak); err != nil {
+				t.Fatalf("UpdateAntigravityCycle: %v", err)
+			}
+
+			tr := NewAntigravityTracker(s, nil)
+			called := false
+			tr.SetOnReset(func(string) { called = true })
+			captured := oldReset.Add(time.Minute)
+			newReset := captured.Add(5 * time.Hour)
+			if err := tr.processModel(makeModel("gemini-5h", "Gemini 5h", 1.0, &newReset), captured); err != nil {
+				t.Fatalf("processModel: %v", err)
+			}
+			if called != tc.want {
+				t.Fatalf("onReset called = %v, want %v", called, tc.want)
+			}
+		})
+	}
+}
+
+// Continuous polling of an idle bucket: the rollover is caught by Method 1
+// (reset time moved), and must still not notify.
+func TestAntigravityTracker_IdleRollover_ContinuousPolling_NoNotification(t *testing.T) {
+	t.Parallel()
+	s, _ := store.New(":memory:")
+	defer s.Close()
+	tr := NewAntigravityTracker(s, nil)
+	calls := 0
+	tr.SetOnReset(func(string) { calls++ })
+
+	base := time.Date(2026, 11, 26, 9, 0, 0, 0, time.UTC)
+	reset1 := base.Add(5 * time.Hour)
+	reset2 := reset1.Add(5 * time.Hour)
+	for _, snap := range []*api.AntigravitySnapshot{
+		makeAntigravitySnapshot(base, []api.AntigravityModelQuota{makeModel("3p-5h", "Claude + GPT 5h", 1.0, &reset1)}),
+		makeAntigravitySnapshot(base.Add(time.Hour), []api.AntigravityModelQuota{makeModel("3p-5h", "Claude + GPT 5h", 1.0, &reset1)}),
+		makeAntigravitySnapshot(reset1.Add(time.Minute), []api.AntigravityModelQuota{makeModel("3p-5h", "Claude + GPT 5h", 1.0, &reset2)}),
+	} {
+		if err := tr.Process(snap); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+	}
+	if history, _ := s.QueryAntigravityCycleHistory("3p-5h"); len(history) != 1 {
+		t.Fatalf("closed cycles = %d, want 1", len(history))
+	}
+	if calls != 0 {
+		t.Fatalf("onReset calls = %d, want 0 for an idle window", calls)
+	}
+}
+
+// Dated poll with usage -> expired undated poll -> first dated usage poll of
+// the next window: one rollover, one alert, and the new window's first usage
+// lands in the new cycle.
+func TestAntigravityTracker_ExpiredUndatedThenDated_SingleRollover(t *testing.T) {
+	t.Parallel()
+	s, _ := store.New(":memory:")
+	defer s.Close()
+	tr := NewAntigravityTracker(s, nil)
+	calls := 0
+	tr.SetOnReset(func(string) { calls++ })
+
+	base := time.Date(2026, 11, 26, 9, 0, 0, 0, time.UTC)
+	reset1 := base.Add(5 * time.Hour)
+	expired := reset1.Add(time.Hour)
+	used := expired.Add(time.Hour)
+	reset2 := used.Add(5 * time.Hour)
+	for _, snap := range []*api.AntigravitySnapshot{
+		makeAntigravitySnapshot(base, []api.AntigravityModelQuota{makeModel("3p-5h", "Claude + GPT 5h", 0.7, &reset1)}),
+		makeAntigravitySnapshot(expired, []api.AntigravityModelQuota{makeModel("3p-5h", "Claude + GPT 5h", 1.0, nil)}),
+		makeAntigravitySnapshot(used, []api.AntigravityModelQuota{makeModel("3p-5h", "Claude + GPT 5h", 0.9, &reset2)}),
+	} {
+		if err := tr.Process(snap); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+	}
+
+	if history, _ := s.QueryAntigravityCycleHistory("3p-5h"); len(history) != 1 {
+		t.Fatalf("closed cycles = %d, want 1", len(history))
+	}
+	if calls != 1 {
+		t.Fatalf("onReset calls = %d, want 1", calls)
+	}
+	active, _ := s.QueryActiveAntigravityCycle("3p-5h")
+	if active == nil || !active.CycleStart.Equal(expired) || active.ResetTime == nil || !active.ResetTime.Equal(reset2) {
+		t.Fatalf("active cycle = %+v, want start %v and ResetTime %v", active, expired, reset2)
+	}
+	if active.TotalDelta < 0.099 || active.TotalDelta > 0.101 {
+		t.Fatalf("TotalDelta = %v, want ~0.1", active.TotalDelta)
+	}
+}
