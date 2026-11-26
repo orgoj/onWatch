@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+
+	pty "github.com/aymanbagabas/go-pty"
 )
 
 // killAgyTree terminates the managed agy process and its child language server.
@@ -18,3 +20,7 @@ func killAgyTree(p *os.Process) {
 	_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(p.Pid)).Run()
 	_ = p.Kill()
 }
+
+// reapAgy is a no-op on Windows: zombies are a Unix concept, and go-pty's
+// Windows Wait is not safe to race with its context watcher.
+func reapAgy(*pty.Cmd) {}

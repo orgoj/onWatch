@@ -366,6 +366,7 @@ func (r *AntigravityCLIRunner) killSession(sess *agySession) {
 	}
 	if sess.cmd != nil && sess.cmd.Process != nil {
 		killAgyTree(sess.cmd.Process)
+		reapAgy(sess.cmd)
 	}
 	if sess.pty != nil {
 		_ = sess.pty.Close()
